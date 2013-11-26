@@ -1,0 +1,653 @@
+#!/usr/bin/perl
+#
+# Push files to a remote location via ftp.
+# Keeps track of what's been previously pushed.
+#
+use strict;
+use warnings;
+use Getopt::Long;
+use File::Find;
+use Digest::MD5;
+use Net::FTP;
+
+my ($THIS) = $0 =~ m%([^/]+)$%;
+my $USAGE = "usage: $THIS local-directory remote-host user pass\n";
+
+my $MAX_FAILURES = 4;
+my $STATUS_FILE;
+my @LOCALSKIP;
+my @AUDITSKIP;
+my $QUIET;
+my $DRYRUN;
+my $AUDIT;
+my $DEBUG;
+my $DEBUGFTP;
+
+Getopt::Long::config("bundling");
+GetOptions
+("status|s=s" => \$STATUS_FILE,
+ #
+ # The name of the status file.
+ # Default is local-directory/.ftp-push
+ #
+
+ "skip=s" => \@LOCALSKIP,
+ #
+ # A regex of local files to skip.  The regex is matched against the path
+ # name, which is an absolute path name.
+ #
+
+ "quiet|q" => \$QUIET,
+ #
+ # Don't announce what FTP operations are done.
+ #
+
+ "dry-run|n" => \$DRYRUN,
+ #
+ # Don't actually make any changes, just tell what would be done.
+ #
+
+ "audit|a" => \$AUDIT,
+ #
+ # See what files are actually on the FTP server.
+ #
+
+ "audit-skip=s" => \@AUDITSKIP,
+ #
+ # A regex of remote files to ignore during an audit.  The regex is matched
+ # against partial (relative) path names.
+ #
+
+ "debug!" => \$DEBUG,
+ "debugftp!" => \$DEBUGFTP,
+ "D" => sub { $DEBUGFTP = $DEBUG = 1 },
+ #
+ # Debug mode.
+ #
+)
+or die $USAGE;
+
+@ARGV or die $USAGE;
+my $LOCAL_DIR = shift;
+
+my $NUM_FAILURES = 0;
+my $REMOTE_HOST;
+my $USER;
+my $PASS;
+
+if (@ARGV == 3)
+{
+    $REMOTE_HOST = shift;
+    $USER = shift;
+    $PASS = shift;
+}
+elsif (@ARGV == 1)
+{
+    my $file = shift;
+    open my $fh, $file
+	or die "open $file: $!";
+    my @lines = <$fh>;
+    @lines == 3 or die "wrong number of lines (" . @lines . ") in $file";
+    chomp @lines;
+    $REMOTE_HOST = shift @lines;
+    $USER = shift @lines;
+    $PASS = shift @lines;
+}
+else
+{
+    die $USAGE;
+}
+
+$STATUS_FILE = "$LOCAL_DIR/.ftp-push"
+    unless $STATUS_FILE;
+warn "> status file '$STATUS_FILE'\n" if $DEBUG;
+
+my $LOCALSKIP = join("|", @LOCALSKIP);
+warn "> local skip '$LOCALSKIP'\n" if $DEBUG;
+
+my $AUDITSKIP = join("|", @AUDITSKIP);
+warn "> local skip '$AUDITSKIP'\n" if $DEBUG;
+
+my $exit = 0;
+
+#
+# Get the names of all files.
+#
+my @local_files;
+my %local_files;
+sub wanted
+{
+    #warn "> file '$File::Find::name' ($_)\n" if $DEBUG;
+    if ($_ eq "." && $LOCAL_DIR ne $File::Find::name)
+    {
+	# Get the canonical version of $LOCAL_DIR.
+	warn "> local_dir was '$LOCAL_DIR' is '$File::Find::name'\n" if $DEBUG;
+	$LOCAL_DIR = $File::Find::name;
+    }
+    return if $File::Find::name eq $STATUS_FILE;
+    return if /~$/;
+    return if /^\#/;
+    return if /^\.\#/;
+    return unless -f;
+    return if @LOCALSKIP && $File::Find::name =~ /$LOCALSKIP/o;
+    push @local_files, $File::Find::name;
+}
+sub find_local_files
+{
+    find({ wanted => \&wanted, follow_fast => 1 }, $LOCAL_DIR);
+    #
+    # Make all path names relative to the base directory.
+    #
+    for (@local_files)
+    {
+	s%^\Q$LOCAL_DIR\E/%%;
+    }
+    @local_files = sort @local_files;
+    %local_files = map { $_ => 1 } @local_files;
+}
+#
+# Calculate the current signature of a local file.
+#
+sub get_signature
+{
+    my ($name) = @_;
+
+    warn "> md5sum $name\n" if $DEBUG;
+    my $file = "$LOCAL_DIR/$name";
+    open my $fh, $file
+	or die "open '$file': $!";
+    binmode $fh;
+    my $md5 = Digest::MD5->new;
+    $md5->addfile($fh);
+    return $md5->hexdigest();
+}
+#
+# Get the last-modification time a local file.
+#
+sub get_timestamp
+{
+    my ($name) = @_;
+
+    my $file = "$LOCAL_DIR/$name";
+    my @stat = lstat $file;
+    @stat or die "lstat '$file': $!";
+    my $t0 = $stat[9];
+    return $t0
+	unless -l _;
+
+    warn "> symlink: $file\n" if $DEBUG;
+    @stat = stat $file;
+    @stat or die "stat '$file': $!";
+    my $t1 = $stat[9];
+
+    return $t0 . "_" . $t1;
+}
+sub directory_of
+{
+    local $_ = shift;
+    s%/+$%%;
+    s%[^/]+$%%;
+    s%/+$%%;
+    return $_;
+}
+sub is_directory_used
+{
+    my ($dir, @files) = @_;
+    # See if any of the given files is in the given directory.
+
+    $dir .= "/";
+    #warn "> compare {$dir}\n" if $DEBUG;
+    for my $file (@files)
+    {
+	next if length($file) < length($dir);
+	my $x = substr($file, 0, length($dir));
+	#warn ">    with {$x}\n" if $DEBUG;
+	return 1 if $dir eq $x;
+    }
+    return 0;
+}
+#
+# Read the status file that indicates the last-known state of the ftp site.
+#
+# Each time we make a change on the ftp site, we append log entries to the
+# status file so that we will recover properly even if we die during the
+# change.  We append a log entry before starting each change, and then another
+# entry when the change is complete.
+#
+#  FILE <timestamp> <signature> <name>
+#     If <signature> is "-" then we were updating the file and we don't
+#     know what its current status is.
+#     Otherwise, <signature> is the 32-character MD5 signature of
+#     the contents of the file.
+#
+#  RM <name>
+#     The file was deleted.
+#
+my %last_signature;
+my %last_timestamp;
+my $dirty;
+sub read_status_file
+{
+    my $fh;
+    unless (open $fh, $STATUS_FILE)
+    {
+	$! eq "No such file or directory"
+	    or die "open '$STATUS_FILE': $!";
+	warn "> no file '$STATUS_FILE'" if $DEBUG;
+	return;
+    }
+    while (<$fh>)
+    {
+	chomp;
+	if (/^FILE (\w+) (\w{32}|-) (\S+)$/)
+	{
+	    $last_timestamp{$3} = $1;
+	    $last_signature{$3} = $2;
+	    next;
+	}
+	if (/^RM (\S+)$/)
+	{
+	    delete $last_timestamp{$1};
+	    delete $last_signature{$1};
+	    next;
+	}
+	warn "$STATUS_FILE:$.: Skipping malformed line '$_'\n";
+    }
+}
+#
+# Write out the new status file.
+#
+sub write_status_file
+{
+    if ($DRYRUN)
+    {
+	warn "> not updating status file because --dry-run\n" if $DEBUG;
+	return;
+    }
+    unless ($dirty)
+    {
+	warn "> status file unchanged\n" if $DEBUG;
+	return;
+    }
+    my $tmp = "$STATUS_FILE.$$~";
+    open my $fh, ">$tmp"
+	or die "open '$tmp': $!";
+    for my $file (sort keys %last_signature)
+    {
+	my $ts = $last_timestamp{$file};
+	my $sig = $last_signature{$file};
+	print $fh "FILE $ts $sig $file\n"
+	    or die "write '$tmp': $!";
+    }
+    close $fh
+	or die "close '$tmp': $!";
+    warn "> updating '$STATUS_FILE'\n" if $DEBUG;
+    rename $tmp, $STATUS_FILE
+	or die "rename '$tmp' to '$STATUS_FILE': $!";
+}
+#
+# Append a line to the status file.
+#
+sub add_status
+{
+    my ($line) = @_;
+
+    if ($DRYRUN)
+    {
+	warn "> not adding status line because --dry-run: $line\n" if $DEBUG;
+	return;
+    }
+
+    warn "> add status '$line'\n" if $DEBUG;
+    open my $fh, ">>$STATUS_FILE"
+	or die "open '$STATUS_FILE': $!";
+    print $fh "$line\n"
+	or die "write '$STATUS_FILE': $!";
+    close $fh
+	or die "close '$STATUS_FILE': $!";
+}
+#
+# We don't establish the connection to the ftp server until
+# we're sure we need it.
+#
+my $ftp;
+sub get_ftp
+{
+    unless ($ftp)
+    {
+	warn "> new ftp |$REMOTE_HOST|..." if $DEBUG;
+	$ftp = Net::FTP->new($REMOTE_HOST, Passive => 1, Debug => $DEBUGFTP);
+	$ftp or die "ftp '$REMOTE_HOST': $@";
+	warn "> login..." if $DEBUG;
+	$ftp->login($USER, $PASS)
+	    or die "Login failed for $USER: ", $ftp->message;
+	$ftp->binary()
+	    or die "Failed to set binary mode: ", $ftp->message;
+	warn "> connected" if $DEBUG;
+    }
+    return $ftp;
+}
+#
+# Close the connection to the ftp server.
+#
+sub disconnect
+{
+    return unless $ftp;
+    $ftp->quit()
+	or warn "failed while disconnecting: ", $ftp->message;
+}
+#
+# On the ftp site, delete any files that no longer exist locally.
+# If the directory becomes empty, remove it too.
+#
+sub remove_deleted
+{
+    my @rm;
+    for my $file (sort keys %last_signature)
+    {
+	if (exists $local_files{$file})
+	{
+	    #warn "> still exists: $file\n" if $DEBUG;
+	    next;
+	}
+	push @rm, $file;
+    }
+    for my $file (@rm)
+    {
+	warn "> rm '$file'\n" if $DEBUG;
+	add_status "FILE 0 - $file";
+	unless (get_ftp()->delete($file))
+	{
+	    warn "failed to delete $file: ", $ftp->message;
+	    $exit = 1;
+	    next;
+	}
+	++$dirty;
+	print "rm $file\n" unless $QUIET;
+	add_status "RM $file";
+	delete $last_signature{$file};
+	my $dir = directory_of($file);
+	while (length($dir) && !is_directory_used($dir, keys %last_signature))
+	{
+	    warn "> rmdir '$dir'\n" if $DEBUG;
+	    if ($DRYRUN || get_ftp()->rmdir($dir))
+	    {
+		print "rmdir $dir\n" unless $QUIET;
+	    }
+	    else
+	    {
+		warn "failed to rmdir $dir: ", $ftp->message;
+		$exit = 1;
+	    }
+	    $dir = directory_of($dir);
+	}
+    }
+}
+#
+# Copy any files that have changed or are new.
+# Make any directories we need to make.
+#
+sub copy_new
+{
+    for my $file (@local_files)
+    {
+	#
+	# Get the local file's signature.  If the file's timestamp hasn't
+	# changed since the last time we calculated the signature, then use
+	# the last signature.
+	#
+	my $sig;
+	my $ts = get_timestamp($file);
+	if ($last_timestamp{$file} && $ts eq $last_timestamp{$file})
+	{
+	    $sig = $last_signature{$file};
+	}
+	else
+	{
+	    $sig = get_signature($file);
+	}
+	#
+	# If the signature has not changed, then skip this file.
+	#
+	my $lk = $last_signature{$file};
+	$lk = "<none>"
+	    unless defined $lk;
+	if ($sig eq $lk)
+	{
+	    warn "> unchanged '$sig' '$file'\n" if $DEBUG;
+	    if ($last_timestamp{$file} && $last_timestamp{$file} ne $ts)
+	    {
+		warn "Touched but actually unchanged: $file\n";
+		if ($DEBUG)
+		{
+		    warn " -> " . localtime($last_timestamp{$file}), "\n";
+		    warn " -> " . localtime($ts), "\n";
+		}
+	    }
+	    add_status "FILE $ts $sig $file"
+		if !$last_timestamp{$file} || $last_timestamp{$file} ne $ts;
+	    $last_timestamp{$file} = $ts;
+	    next;
+	}
+	warn "> new signature '$sig' '$lk' '$file'\n" if $DEBUG;
+	#
+	# Make the directories for this file.
+	#
+	++$dirty;
+	my $dir = directory_of($file);
+	if (length($dir) && !is_directory_used($dir, keys %last_signature))
+	{
+	    warn "> mkdir '$dir'\n" if $DEBUG;
+	    if (! $DRYRUN && !get_ftp()->mkdir($dir, 1)) { # 1=recursive
+		warn "failed to mkdir $dir: ", $ftp->message;
+		$exit = 1;
+	    }
+	    print "mkdir $dir\n" unless $QUIET;
+	}
+	delete $last_signature{$file};
+	delete $last_timestamp{$file};
+	add_status "FILE 0 - $file";
+	warn "> put '$LOCAL_DIR/$file' as '$file'\n" if $DEBUG;
+	if (! $DRYRUN && !get_ftp()->put("$LOCAL_DIR/$file", $file))
+	{
+	    warn "failed to put $file: ", $ftp->message;
+	    die "too many failures, giving up"
+		if ++$NUM_FAILURES >= $MAX_FAILURES;
+	    $exit = 1;
+	    next;
+	}
+	add_status "FILE $ts $sig $file";
+	$last_signature{$file} = $sig;
+	$last_timestamp{$file} = $ts;
+	print "put $file\n" unless $QUIET;
+    }
+}
+#
+# See what files are actually on the ftp server.
+#
+sub list_actual_entries
+{
+    my ($dirs, $files) = @_;
+    local $_;
+
+    my $ftp = get_ftp();
+    warn "> ls -lR...\n" if $DEBUG;
+    my @ls = $ftp->ls("-lR");
+    warn "> ls -lR returned " . @ls . "\n" if $DEBUG;
+
+    my $dir = "";
+    for (@ls)
+    {
+	next if /^$/;
+	if (m%^\./(.*):$%)
+	{
+	    $dir = $1;
+	    warn ">  dir='$dir' ($_)\n" if $DEBUG;
+	    ++$dirs->{$dir};
+	    $dir .= "/";
+	    next;
+	}
+
+#-rwx---r-x    1 3763828  450           205 Jan 23 15:12 error.html
+	if (/^-[r-][w-][x-]
+               [r-][w-][x-]
+               [r-][w-][x-]\s+
+	       \d+\s             # links
+	       \d+\s+            # owner
+	       \d+\s+            # group
+	       (\d+)\s           # size
+	       [A-Z][a-z][a-z]\s # month
+	       [\s\d]\d\s	 # day
+	       \d\d:\d\d\s	 # hh:mm
+	       (.+)		 # name
+	       $/x)
+	{
+	    my $size = $1 + 0;
+	    my $name = "$dir$2";
+	    $files->{$name} = $size;
+	    warn ">  file '$name'=$size ($_)\n" if $DEBUG;
+	    next;
+	}
+
+	if (/^d/)
+	{
+	    warn ">  subdir ($_)\n" if $DEBUG;
+	    next;
+	}
+	if (/^lrwxrwxrwx /)
+	{
+	    warn "> symlink ($_)\n" if $DEBUG;
+	    next;
+	}
+
+	warn "unmatched '$_'";
+    }
+}
+
+#
+# Here's the old implementation of list_actual_entries.  I found it to be
+# temperamental.  For example, cwd would return true indicating it succeeded
+# even though $DEBUGFTP would show that cwd actually failed.  And ls on a file
+# would sometimes return an empty array.  And sometimes the ftp connection
+# would drop part way through.
+#
+#sub list_actual_entries
+#{
+#    my ($dirs, $files) = @_;
+#    local $_;
+#
+#    my $ftp = get_ftp();
+#    my @a = $ftp->ls();
+#    warn "> at top, got " . @a if $DEBUG;
+#    while (@a)
+#    {
+#	$_ = shift @a;
+#	next if $_ eq ".";
+#	next if $_ eq "..";
+#	next if $dirs->{$_};
+#	next if $files->{$_};
+#
+#	if (/\.(jpg|php|html|mov|gif)$/)
+#	{
+#	    warn "> assumed file '$_' (" . @a . ")\n" if $DEBUG;
+#	    ++$files->{$_};
+#	    next;
+#	}
+#
+#	warn "> pwd before '", $ftp->pwd(), "'\n" if $DEBUG;
+#	my $ok = $ftp->cwd("/$_");
+#	warn "> pwd after  '", $ftp->pwd(), "'\n" if $DEBUG;
+#	unless ($ok)
+#	{
+#	    warn "> cwd failed, assuming file '$_' (" . @a . ")\n" if $DEBUG;
+#	    ++$files->{$_};
+#	    next;
+#	}
+#	warn "> cwd '/$_' - ok\n";
+#
+#	my @entries = $ftp->ls();
+#	warn "> dir '$_' has " . @entries . " (" . @a . ")\n" if $DEBUG;
+#	++$dirs->{$_};
+#	if (@entries == 0)
+#	{
+#	    warn "directory '$_' is empty";
+#	    next;
+#	}
+#	for my $name (@entries)
+#	{
+#	    next if $name eq ".";
+#	    next if $name eq "..";
+#	    push @a, "$_/$name";
+#	    warn "> > add '$a[-1]'\n" if $DEBUG;
+#	}
+#    }
+#}
+
+sub audit
+{
+    my %actual_dirs;
+    my %actual_files;
+    list_actual_entries \%actual_dirs, \%actual_files;
+
+    my $warn = "-- Audit Found Unexpected --\n";
+    for my $file (sort keys %actual_files)
+    {
+	# Skip this file if it has already been marked for update
+	next if $last_signature{$file} eq "-";
+
+	next if @AUDITSKIP && $file =~ /$AUDITSKIP/o;
+
+	if (exists $last_signature{$file})
+	{
+	    my $local_name = "$LOCAL_DIR/$file";
+	    my $local_size = -s $local_name;
+	    unless (defined $local_size)
+	    {
+		warn "stat $local_name: $!";
+		next;
+	    }
+	    my $actual_size = $actual_files{$file};
+	    next if $local_size == $actual_size;
+	    print "size mismatch for file $file\n";
+	    print "  local  $local_size\n";
+	    print "  remote $actual_size\n";
+	}
+	print $warn; $warn = "";
+	print "# echo \"FILE 0 - $file\" >> $STATUS_FILE\n";
+    }
+    my %did;
+    for my $dir (sort keys %actual_dirs)
+    {
+	while (length($dir) && !is_directory_used($dir, keys %last_signature))
+	{
+	    last if $did{$dir}++;
+	    next if @AUDITSKIP && $dir =~ /$AUDITSKIP/o;
+	    print $warn; $warn = "";
+	    print "# rmdir $dir\n";
+	    $dir = directory_of($dir);
+	}
+    }
+    $warn = "-- Missing --\n";
+    for my $file (sort keys %last_signature)
+    {
+	next if exists $actual_files{$file};
+	print $warn; $warn = "";
+	print "# echo \"RM $file\" >> $STATUS_FILE\n";
+    }
+}
+
+read_status_file();
+if ($AUDIT)
+{
+    audit();
+}
+else
+{
+    find_local_files();
+    remove_deleted();
+    copy_new();
+}
+disconnect();
+write_status_file();
+
+exit $exit;
