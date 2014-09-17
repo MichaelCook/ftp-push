@@ -389,8 +389,11 @@ sub remove_deleted
 #
 sub copy_new
 {
+    my $num = @local_files;
+    my $rem = $num;
     for my $file (@local_files)
     {
+	--$rem;
 	#
 	# Get the local file's signature.  If the file's timestamp hasn't
 	# changed since the last time we calculated the signature, then use
@@ -459,7 +462,7 @@ sub copy_new
 	add_status "FILE $ts $sig $file";
 	$last_signature{$file} = $sig;
 	$last_timestamp{$file} = $ts;
-	print "put $file\n" unless $QUIET;
+	print "put $file ($rem/$num)\n" unless $QUIET;
     }
 }
 #
