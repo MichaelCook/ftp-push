@@ -11,7 +11,7 @@ use Digest::MD5;
 use Net::FTP;
 
 my ($THIS) = $0 =~ m%([^/]+)$%;
-my $USAGE = "usage: $THIS local-directory remote-host user pass\n";
+my $USAGE = "usage: $THIS server-info.pl local-directory\n";
 
 my $MAX_FAILURES = 4;
 my $STATUS_FILE;
@@ -20,6 +20,7 @@ my @AUDITSKIP;
 my $QUIET;
 my $DRYRUN;
 my $AUDIT;
+my $CHECK;
 my $DEBUG;
 my $DEBUGFTP;
 
@@ -58,45 +59,24 @@ GetOptions
  # against partial (relative) path names.
  #
 
+ "check" => \$CHECK,
+ #
+ # Verify this script has what it needs to run.
+ #
+
  "debug!" => \$DEBUG,
  "debugftp!" => \$DEBUGFTP,
- "D" => sub { $DEBUGFTP = $DEBUG = 1 },
- #
- # Debug mode.
- #
-)
+ "D" => sub { $DEBUGFTP = $DEBUG = 1 })
 or die $USAGE;
 
-@ARGV or die $USAGE;
+exit 0 if $CHECK;
+
+@ARGV == 2 or die $USAGE;
+my $server = do shift
+    or die "trouble with server info ($!) ($@)";
 my $LOCAL_DIR = shift;
 
 my $NUM_FAILURES = 0;
-my $REMOTE_HOST;
-my $USER;
-my $PASS;
-
-if (@ARGV == 3)
-{
-    $REMOTE_HOST = shift;
-    $USER = shift;
-    $PASS = shift;
-}
-elsif (@ARGV == 1)
-{
-    my $file = shift;
-    open my $fh, $file
-	or die "open $file: $!";
-    my @lines = <$fh>;
-    @lines == 3 or die "wrong number of lines (" . @lines . ") in $file";
-    chomp @lines;
-    $REMOTE_HOST = shift @lines;
-    $USER = shift @lines;
-    $PASS = shift @lines;
-}
-else
-{
-    die $USAGE;
-}
 
 $STATUS_FILE = "$LOCAL_DIR/.ftp-push"
     unless $STATUS_FILE;
@@ -315,12 +295,12 @@ sub get_ftp
 {
     unless ($ftp)
     {
-	warn "> new ftp |$REMOTE_HOST|..." if $DEBUG;
-	$ftp = Net::FTP->new($REMOTE_HOST, Passive => 1, Debug => $DEBUGFTP);
-	$ftp or die "ftp '$REMOTE_HOST': $@";
+	warn "> new ftp |$server->{host}|..." if $DEBUG;
+	$ftp = Net::FTP->new($server->{host}, Passive => 1, Debug => $DEBUGFTP);
+	$ftp or die "ftp '$server->{host}': $@";
 	warn "> login..." if $DEBUG;
-	$ftp->login($USER, $PASS)
-	    or die "Login failed for $USER: ", $ftp->message;
+	$ftp->login($server->{user}, $server->{pass})
+	    or die "Login failed for $server->{user}: ", $ftp->message;
 	$ftp->binary()
 	    or die "Failed to set binary mode: ", $ftp->message;
 	warn "> connected" if $DEBUG;
@@ -358,9 +338,14 @@ sub remove_deleted
 	add_status "FILE 0 - $file";
 	unless (get_ftp()->delete($file))
 	{
-	    warn "failed to delete $file: ", $ftp->message;
-	    $exit = 1;
-	    next;
+            my $err = $ftp->message;
+            unless ($err =~ /No such file or directory/)
+            {
+                warn "failed to delete $file: $err";
+                $exit = 1;
+                next;
+            }
+            warn "already deleted $file ($err)";
 	}
 	++$dirty;
 	print "rm $file\n" unless $QUIET;
@@ -526,65 +511,6 @@ sub list_actual_entries
 	warn "unmatched '$_'";
     }
 }
-
-#
-# Here's the old implementation of list_actual_entries.  I found it to be
-# temperamental.  For example, cwd would return true indicating it succeeded
-# even though $DEBUGFTP would show that cwd actually failed.  And ls on a file
-# would sometimes return an empty array.  And sometimes the ftp connection
-# would drop part way through.
-#
-#sub list_actual_entries
-#{
-#    my ($dirs, $files) = @_;
-#    local $_;
-#
-#    my $ftp = get_ftp();
-#    my @a = $ftp->ls();
-#    warn "> at top, got " . @a if $DEBUG;
-#    while (@a)
-#    {
-#	$_ = shift @a;
-#	next if $_ eq ".";
-#	next if $_ eq "..";
-#	next if $dirs->{$_};
-#	next if $files->{$_};
-#
-#	if (/\.(jpg|php|html|mov|gif)$/)
-#	{
-#	    warn "> assumed file '$_' (" . @a . ")\n" if $DEBUG;
-#	    ++$files->{$_};
-#	    next;
-#	}
-#
-#	warn "> pwd before '", $ftp->pwd(), "'\n" if $DEBUG;
-#	my $ok = $ftp->cwd("/$_");
-#	warn "> pwd after  '", $ftp->pwd(), "'\n" if $DEBUG;
-#	unless ($ok)
-#	{
-#	    warn "> cwd failed, assuming file '$_' (" . @a . ")\n" if $DEBUG;
-#	    ++$files->{$_};
-#	    next;
-#	}
-#	warn "> cwd '/$_' - ok\n";
-#
-#	my @entries = $ftp->ls();
-#	warn "> dir '$_' has " . @entries . " (" . @a . ")\n" if $DEBUG;
-#	++$dirs->{$_};
-#	if (@entries == 0)
-#	{
-#	    warn "directory '$_' is empty";
-#	    next;
-#	}
-#	for my $name (@entries)
-#	{
-#	    next if $name eq ".";
-#	    next if $name eq "..";
-#	    push @a, "$_/$name";
-#	    warn "> > add '$a[-1]'\n" if $DEBUG;
-#	}
-#    }
-#}
 
 sub audit
 {
