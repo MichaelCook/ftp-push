@@ -18,6 +18,7 @@ my $STATUS_FILE;
 my @LOCALSKIP;
 my @AUDITSKIP;
 my $QUIET;
+my $PROGRESS;
 my $DRYRUN;
 my $AUDIT;
 my $CHECK;
@@ -41,6 +42,11 @@ GetOptions
  "quiet|q" => \$QUIET,
  #
  # Don't announce what FTP operations are done.
+ #
+
+ "progress" => \$PROGRESS,
+ #
+ # Show copying progress with ### hash marks.
  #
 
  "dry-run|n" => \$DRYRUN,
@@ -72,9 +78,11 @@ or die $USAGE;
 exit 0 if $CHECK;
 
 @ARGV == 2 or die $USAGE;
-my $server = do shift
-    or die "trouble with server info ($!) ($@)";
+my $serverinfo = shift;
 my $LOCAL_DIR = shift;
+
+my $server = do $serverinfo
+    or die "trouble with server info: $serverinfo ($!) ($@)";
 
 my $NUM_FAILURES = 0;
 
@@ -86,9 +94,31 @@ my $LOCALSKIP = join("|", @LOCALSKIP);
 warn "> local skip '$LOCALSKIP'\n" if $DEBUG;
 
 my $AUDITSKIP = join("|", @AUDITSKIP);
-warn "> local skip '$AUDITSKIP'\n" if $DEBUG;
+warn "> audit skip '$AUDITSKIP'\n" if $DEBUG;
 
 my $exit = 0;
+
+sub size_of_file
+{
+    my ($file) = @_;
+
+    my $size = -s $file;
+    unless (defined $size)
+    {
+        warn "stat $file: $!";
+        return 0;
+    }
+    return $size;
+}
+
+sub plural
+{
+    my ($n, $label) = @_;
+    my $ret = "$n $label";
+    $ret .= "s"
+        unless $n == 1;
+    return $ret;
+}
 
 #
 # Get the names of all files.
@@ -296,7 +326,10 @@ sub get_ftp
     unless ($ftp)
     {
 	warn "> new ftp |$server->{host}|..." if $DEBUG;
-	$ftp = Net::FTP->new($server->{host}, Passive => 1, Debug => $DEBUGFTP);
+	$ftp = Net::FTP->new($server->{host},
+                             Passive => 1,
+                             Debug => $DEBUGFTP,
+                             $PROGRESS ? (Hash => \*STDOUT) : ());
 	$ftp or die "ftp '$server->{host}': $@";
 	warn "> login..." if $DEBUG;
 	$ftp->login($server->{user}, $server->{pass})
@@ -374,55 +407,87 @@ sub remove_deleted
 #
 sub copy_new
 {
-    my $num = @local_files;
-    my $rem = $num;
-    for my $file (@local_files)
+    my @copy;
+    for my $name (@local_files)
     {
-	--$rem;
 	#
 	# Get the local file's signature.  If the file's timestamp hasn't
 	# changed since the last time we calculated the signature, then use
 	# the last signature.
 	#
-	my $sig;
-	my $ts = get_timestamp($file);
-	if ($last_timestamp{$file} && $ts eq $last_timestamp{$file})
+	my $signature;
+	my $timestamp = get_timestamp($name);
+	if ($last_timestamp{$name} && $timestamp eq $last_timestamp{$name})
 	{
-	    $sig = $last_signature{$file};
+	    $signature = $last_signature{$name};
 	}
 	else
 	{
-	    $sig = get_signature($file);
+	    $signature = get_signature($name);
 	}
 	#
 	# If the signature has not changed, then skip this file.
 	#
-	my $lk = $last_signature{$file};
+	my $lk = $last_signature{$name};
 	$lk = "<none>"
 	    unless defined $lk;
-	if ($sig eq $lk)
+	if ($signature eq $lk)
 	{
-	    warn "> unchanged '$sig' '$file'\n" if $DEBUG;
-	    if ($last_timestamp{$file} && $last_timestamp{$file} ne $ts)
+	    warn "> unchanged '$signature' '$name'\n" if $DEBUG;
+	    if ($last_timestamp{$name} && $last_timestamp{$name} ne $timestamp)
 	    {
-		warn "Touched but actually unchanged: $file\n";
+		warn "Touched but actually unchanged: $name\n";
 		if ($DEBUG)
 		{
-		    warn " -> " . localtime($last_timestamp{$file}), "\n";
-		    warn " -> " . localtime($ts), "\n";
+		    warn " -> " . localtime($last_timestamp{$name}), "\n";
+		    warn " -> " . localtime($timestamp), "\n";
 		}
 	    }
-	    add_status "FILE $ts $sig $file"
-		if !$last_timestamp{$file} || $last_timestamp{$file} ne $ts;
-	    $last_timestamp{$file} = $ts;
+	    add_status "FILE $timestamp $signature $name"
+		if !$last_timestamp{$name} ||
+                   $last_timestamp{$name} ne $timestamp;
+	    $last_timestamp{$name} = $timestamp;
 	    next;
 	}
-	warn "> new signature '$sig' '$lk' '$file'\n" if $DEBUG;
-	#
+	warn "> new signature '$signature' '$lk' '$name'\n" if $DEBUG;
+        push @copy, { name => $name,
+                      timestamp => $timestamp,
+                      signature => $signature,
+                      size => size_of_file("$LOCAL_DIR/$name") };
+    }
+
+    unless (@copy)
+    {
+        warn "> no files to copy\n" if $DEBUG;
+        return;
+    }
+    ++$dirty;
+
+    my $bytes_to_copy = 0;
+    for my $copy (@copy)
+    {
+        $bytes_to_copy += $copy->{size};
+    }
+
+    print("Will copy ", plural(0 + @copy, "file"), ", ",
+          plural($bytes_to_copy, "byte"), "\n")
+        unless $QUIET;
+
+    my $bytes_copied = 0;
+    while (@copy)
+    {
+        my $copy = shift @copy;
+        my $name = $copy->{name};
+        my $size = $copy->{size};
+        my $timestamp = $copy->{timestamp};
+        my $signature = $copy->{signature};
+        print "Copying $size $name\n"
+            unless $QUIET;
+
+        #
 	# Make the directories for this file.
 	#
-	++$dirty;
-	my $dir = directory_of($file);
+	my $dir = directory_of($name);
 	if (length($dir) && !is_directory_used($dir, keys %last_signature))
 	{
 	    warn "> mkdir '$dir'\n" if $DEBUG;
@@ -432,22 +497,28 @@ sub copy_new
 	    }
 	    print "mkdir $dir\n" unless $QUIET;
 	}
-	delete $last_signature{$file};
-	delete $last_timestamp{$file};
-	add_status "FILE 0 - $file";
-	warn "> put '$LOCAL_DIR/$file' as '$file'\n" if $DEBUG;
-	if (! $DRYRUN && !get_ftp()->put("$LOCAL_DIR/$file", $file))
+	delete $last_signature{$name};
+	delete $last_timestamp{$name};
+	add_status "FILE 0 - $name";
+	warn "> put '$LOCAL_DIR/$name' as '$name'\n" if $DEBUG;
+	if (! $DRYRUN && !get_ftp()->put("$LOCAL_DIR/$name", $name))
 	{
-	    warn "failed to put $file: ", $ftp->message;
+	    warn "failed to put $name: ", $ftp->message;
 	    die "too many failures, giving up"
 		if ++$NUM_FAILURES >= $MAX_FAILURES;
 	    $exit = 1;
 	    next;
 	}
-	add_status "FILE $ts $sig $file";
-	$last_signature{$file} = $sig;
-	$last_timestamp{$file} = $ts;
-	print "put $file ($rem/$num)\n" unless $QUIET;
+	add_status "FILE $timestamp $signature $name";
+	$last_signature{$name} = $signature;
+	$last_timestamp{$name} = $timestamp;
+
+        $bytes_copied += $size;
+        my $bytes_rem = $bytes_to_copy - $bytes_copied;
+        print(plural(0 + @copy, "file"), " remaining, ",
+              sprintf("%.0f%%", 100 * $bytes_rem / $bytes_to_copy),
+              "\n")
+            if @copy && ! $QUIET;
     }
 }
 #
