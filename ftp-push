@@ -3,6 +3,8 @@
 # Push files to a remote location via ftp.
 # Keeps track of what's been previously pushed.
 #
+# Copyright (c) 2013, Michael Cook <michael@waxrat.com>. All rights reserved.
+#
 use strict;
 use warnings;
 use Getopt::Long;
